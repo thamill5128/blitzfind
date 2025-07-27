@@ -1,0 +1,47 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "location_001",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-122.4194, 37.7749]
+      },
+      "properties": {
+        "name": "San Francisco",
+        "population": 883305,
+        "country": "USA",
+        "state": "California"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "location_002",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-74.0060, 40.7128]
+      },
+      "properties": {
+        "name": "New York City",
+        "population": 8336697,
+        "country": "USA",
+        "state": "New York"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "location_003",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-0.1276, 51.5074]
+      },
+      "properties": {
+        "name": "London",
+        "population": 8982000,
+        "country": "UK",
+        "region": "Greater London"
+      }
+    }
+  ]
+}

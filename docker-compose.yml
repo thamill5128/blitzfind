@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  blitzfind:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./sample_data.geojson:/app/sample_data.geojson:ro
+    environment:
+      - DATABASE_URL=sqlite:////app/data/blitzfind.db
+    restart: unless-stopped
