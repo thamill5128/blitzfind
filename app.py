@@ -1,14 +1,16 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
-from sqlalchemy import create_engine, Column, String, JSON, DateTime
+from sqlalchemy import create_engine, Column, String, JSON, DateTime, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import json
 import geojson
 from datetime import datetime
 import os
+import tempfile
+import shutil
 
 # Create FastAPI app
 app = FastAPI(title="BlitzFind API", description="Simple key-value query system with GeoJSON support")
@@ -124,6 +126,150 @@ async def import_geojson(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Invalid GeoJSON: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error importing file: {str(e)}")
+
+@app.post("/import/spatialite", tags=["Import"])
+async def import_spatialite(
+    file: UploadFile = File(...),
+    table_name: str = "building",
+    id_column: str = "marking_pg_id",
+    geom_column: str = "geom"
+):
+    """
+    Import data from a SpatiaLite database file.
+    
+    Parameters:
+    - file: The SpatiaLite database file
+    - table_name: Name of the table to import (default: "building")
+    - id_column: Column to use as ID (default: "marking_pg_id")
+    - geom_column: Geometry column name (default: "geom")
+    """
+    if not file.filename.endswith('.sqlite') and not file.filename.endswith('.db') and not file.filename.endswith('.spatialite'):
+        raise HTTPException(status_code=400, detail="File must be a SpatiaLite database file (.sqlite, .db, or .spatialite)")
+    
+    # Create a temporary file to store the uploaded database
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.sqlite') as tmp_file:
+        try:
+            # Write uploaded file to temporary location
+            content = await file.read()
+            tmp_file.write(content)
+            tmp_file.flush()
+            
+            # Connect to the SpatiaLite database
+            spatialite_engine = create_engine(f"sqlite:///{tmp_file.name}")
+            
+            db = next(get_db())
+            imported_count = 0
+            updated_count = 0
+            
+            with spatialite_engine.connect() as conn:
+                # First, try to check if it's a SpatiaLite database
+                is_spatialite = False
+                try:
+                    # Check if spatial_ref_sys table exists (indicates SpatiaLite)
+                    result = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='spatial_ref_sys'"))
+                    if result.fetchone():
+                        is_spatialite = True
+                except:
+                    pass
+                
+                # Build the query based on whether it's SpatiaLite or regular SQLite
+                if is_spatialite:
+                    try:
+                        # Try to load SpatiaLite extension
+                        conn.execute(text("SELECT load_extension('mod_spatialite')"))
+                        # Use AsGeoJSON for SpatiaLite
+                        query = text(f"""
+                            SELECT 
+                                {id_column} as id,
+                                AsGeoJSON({geom_column}) as geometry_json,
+                                *
+                            FROM {table_name}
+                            WHERE {id_column} IS NOT NULL
+                        """)
+                    except:
+                        # If extension loading fails, treat as regular SQLite
+                        is_spatialite = False
+                
+                if not is_spatialite:
+                    # For regular SQLite, assume geometry is already stored as GeoJSON string
+                    query = text(f"""
+                        SELECT 
+                            {id_column} as id,
+                            {geom_column} as geometry_json,
+                            *
+                        FROM {table_name}
+                        WHERE {id_column} IS NOT NULL
+                    """)
+                
+                # Execute query
+                result = conn.execute(query)
+                
+                # Process each row
+                for row in result:
+                    row_dict = dict(row._mapping)
+                    feature_id = str(row_dict['id'])
+                    
+                    # Parse geometry
+                    geometry = None
+                    geometry_data = row_dict.get('geometry_json')
+                    
+                    if geometry_data:
+                        if isinstance(geometry_data, str):
+                            try:
+                                # Try to parse as JSON
+                                geometry = json.loads(geometry_data)
+                            except json.JSONDecodeError:
+                                # If it's not valid JSON, skip this geometry
+                                geometry = None
+                        elif isinstance(geometry_data, dict):
+                            geometry = geometry_data
+                    
+                    # Remove special columns from properties
+                    properties = {k: v for k, v in row_dict.items() 
+                                if k not in ['id', 'geometry_json', geom_column] and v is not None}
+                    
+                    # Create GeoJSON feature
+                    feature = {
+                        "type": "Feature",
+                        "id": feature_id,
+                        "geometry": geometry,
+                        "properties": properties
+                    }
+                    
+                    # Check if record exists
+                    existing = db.query(KeyValueStore).filter(KeyValueStore.id == feature_id).first()
+                    
+                    if existing:
+                        # Update existing record
+                        existing.value = feature
+                        existing.updated_at = datetime.utcnow()
+                        updated_count += 1
+                    else:
+                        # Create new record
+                        new_record = KeyValueStore(
+                            id=feature_id,
+                            value=feature
+                        )
+                        db.add(new_record)
+                        imported_count += 1
+                
+                db.commit()
+                
+            return {
+                "message": "SpatiaLite data imported successfully",
+                "imported": imported_count,
+                "updated": updated_count,
+                "total_records": imported_count + updated_count,
+                "table": table_name,
+                "spatialite_detected": is_spatialite
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error importing SpatiaLite file: {str(e)}")
+        finally:
+            # Clean up temporary file
+            if os.path.exists(tmp_file.name):
+                os.unlink(tmp_file.name)
 
 @app.post("/data", tags=["Data"])
 async def create_key_value(data: KeyValueCreate):
