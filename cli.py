@@ -24,6 +24,24 @@ class BlitzFindCLI:
         except Exception as e:
             return {"error": str(e)}
     
+    def import_spatialite(self, filepath: str, table_name: str = "building", 
+                         id_column: str = "marking_pg_id", geom_column: str = "geom") -> dict:
+        """Import SpatiaLite database file"""
+        try:
+            with open(filepath, 'rb') as f:
+                files = {'file': (filepath, f, 'application/octet-stream')}
+                params = {
+                    'table_name': table_name,
+                    'id_column': id_column,
+                    'geom_column': geom_column
+                }
+                response = requests.post(f"{self.base_url}/import/spatialite", 
+                                       files=files, params=params)
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            return {"error": str(e)}
+    
     def query(self, id: str) -> dict:
         """Query value by ID"""
         try:
@@ -71,6 +89,13 @@ def main():
     import_parser = subparsers.add_parser('import', help='Import GeoJSON file')
     import_parser.add_argument('file', help='Path to GeoJSON file')
     
+    # Import SpatiaLite command
+    import_spatialite_parser = subparsers.add_parser('import-spatialite', help='Import SpatiaLite database')
+    import_spatialite_parser.add_argument('file', help='Path to SpatiaLite database file')
+    import_spatialite_parser.add_argument('--table', default='building', help='Table name (default: building)')
+    import_spatialite_parser.add_argument('--id-column', default='marking_pg_id', help='ID column (default: marking_pg_id)')
+    import_spatialite_parser.add_argument('--geom-column', default='geom', help='Geometry column (default: geom)')
+    
     # Query command
     query_parser = subparsers.add_parser('query', help='Query value by ID')
     query_parser.add_argument('id', help='ID to query')
@@ -100,6 +125,8 @@ def main():
     # Execute command
     if args.command == 'import':
         result = cli.import_geojson(args.file)
+    elif args.command == 'import-spatialite':
+        result = cli.import_spatialite(args.file, args.table, args.id_column, args.geom_column)
     elif args.command == 'query':
         result = cli.query(args.id)
     elif args.command == 'set':

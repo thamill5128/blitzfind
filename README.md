@@ -5,11 +5,12 @@ A simple key-value query system using Python with GeoJSON import capabilities.
 ## Features
 
 1. Import data from GeoJSON files to create a database
-2. Query by ID and return its value
-3. Full CRUD operations for key-value pairs
-4. RESTful API with FastAPI
-5. SQLite database for lightweight storage
-6. Automatic API documentation with Swagger UI
+2. Import data from SpatiaLite databases with geometry support
+3. Query by ID and return its value
+4. Full CRUD operations for key-value pairs
+5. RESTful API with FastAPI
+6. SQLite database for lightweight storage
+7. Automatic API documentation with Swagger UI
 
 ## Installation
 
@@ -75,6 +76,14 @@ Once the server is running, you can access:
   - Upload a GeoJSON file with features that have an `id` field
   - Each feature will be stored as a key-value pair
 
+- `POST /import/spatialite` - Import data from a SpatiaLite database
+  - Upload a SpatiaLite database file (.sqlite, .db, or .spatialite)
+  - Query parameters:
+    - `table_name` (default: "building") - Table to import from
+    - `id_column` (default: "marking_pg_id") - Column to use as ID
+    - `geom_column` (default: "geom") - Geometry column name
+  - Geometry data will be automatically converted to GeoJSON format
+
 ### Query Operations
 - `GET /query/{id}` - Query value by ID (returns found status and value if exists)
 - `GET /data/{id}` - Get a specific key-value pair by ID (returns 404 if not found)
@@ -95,12 +104,20 @@ curl -X POST "http://localhost:8000/import/geojson" \
   -F "file=@sample_data.geojson"
 ```
 
-### 2. Query by ID
+### 2. Import SpatiaLite Data
+```bash
+curl -X POST "http://localhost:8000/import/spatialite?table_name=building&id_column=marking_pg_id&geom_column=geom" \
+  -H "accept: application/json" \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@building_data.sqlite"
+```
+
+### 3. Query by ID
 ```bash
 curl -X GET "http://localhost:8000/query/location_001"
 ```
 
-### 3. Create/Update Key-Value
+### 4. Create/Update Key-Value
 ```bash
 curl -X POST "http://localhost:8000/data" \
   -H "Content-Type: application/json" \
@@ -113,7 +130,7 @@ curl -X POST "http://localhost:8000/data" \
   }'
 ```
 
-### 4. List All Keys
+### 5. List All Keys
 ```bash
 curl -X GET "http://localhost:8000/data?skip=0&limit=10"
 ```
@@ -125,6 +142,9 @@ BlitzFind includes a command-line interface for easy interaction:
 ```bash
 # Import GeoJSON file
 python cli.py import sample_data.geojson
+
+# Import SpatiaLite database
+python cli.py import-spatialite building_data.sqlite --table building --id-column marking_pg_id --geom-column geom
 
 # Query by ID
 python cli.py query location_001
