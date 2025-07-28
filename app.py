@@ -175,9 +175,27 @@ async def import_spatialite(
                 
                 # Build the query based on whether it's SpatiaLite or regular SQLite
                 if is_spatialite:
-                    try:
-                        # Try to load SpatiaLite extension
-                        conn.execute(text("SELECT load_extension('mod_spatialite')"))
+                    # Try to load SpatiaLite extension from various paths
+                    spatialite_loaded = False
+                    extension_paths = [
+                        'mod_spatialite',  # Default
+                        '/opt/homebrew/lib/mod_spatialite',  # Homebrew on macOS ARM
+                        '/usr/local/lib/mod_spatialite',  # Homebrew on macOS Intel
+                        '/usr/lib/x86_64-linux-gnu/mod_spatialite',  # Ubuntu/Debian
+                        '/usr/lib64/mod_spatialite',  # RHEL/CentOS
+                    ]
+                    
+                    for ext_path in extension_paths:
+                        try:
+                            # 尝试从 Homebrew 安装路径加载
+                            conn.execute(text(f"SELECT load_extension('{ext_path}')"))
+                            spatialite_loaded = True
+                            print(f"Successfully loaded SpatiaLite from: {ext_path}")
+                            break
+                        except Exception as e:
+                            continue
+                    
+                    if spatialite_loaded:
                         # Use AsGeoJSON for SpatiaLite
                         query = text(f"""
                             SELECT 
@@ -187,9 +205,10 @@ async def import_spatialite(
                             FROM {table_name}
                             WHERE {id_column} IS NOT NULL
                         """)
-                    except:
+                    else:
                         # If extension loading fails, treat as regular SQLite
                         is_spatialite = False
+                        print("Failed to load SpatiaLite extension from any known path")
                 
                 if not is_spatialite:
                     # For regular SQLite, assume geometry is already stored as GeoJSON string
