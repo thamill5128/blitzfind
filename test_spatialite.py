@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script for SpatiaLite import functionality
+Test script for SpatiaLite import functionality using Python's default sqlite3 library
 """
 
 import requests

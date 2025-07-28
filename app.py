@@ -12,6 +12,7 @@ import os
 import tempfile
 import shutil
 import re
+import sqlite3
 
 # Create FastAPI app
 app = FastAPI(title="BlitzFind API", description="Simple key-value query system with GeoJSON support")
@@ -155,143 +156,149 @@ async def import_spatialite(
             tmp_file.write(content)
             tmp_file.flush()
             
-            # Connect to the SpatiaLite database
-            spatialite_engine = create_engine(f"sqlite:///{tmp_file.name}")
+            # Connect to the SpatiaLite database using sqlite3
+            conn = sqlite3.connect(tmp_file.name)
+            conn.row_factory = sqlite3.Row  # This allows column access by name
+            cursor = conn.cursor()
             
             db = next(get_db())
             imported_count = 0
             updated_count = 0
             
-            with spatialite_engine.connect() as conn:
-                # First, try to check if it's a SpatiaLite database
-                is_spatialite = False
-                try:
-                    # Check if spatial_ref_sys table exists (indicates SpatiaLite)
-                    result = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='spatial_ref_sys'"))
-                    if result.fetchone():
-                        is_spatialite = True
-                except:
-                    pass
+            # Check if it's a SpatiaLite database
+            is_spatialite = False
+            try:
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='spatial_ref_sys'")
+                if cursor.fetchone():
+                    is_spatialite = True
+            except:
+                pass
+            
+            # Build the query based on whether it's SpatiaLite or regular SQLite
+            if is_spatialite:
+                # Try to load SpatiaLite extension from various paths
+                spatialite_loaded = False
+                extension_paths = [
+                    'mod_spatialite',  # Default
+                    '/opt/homebrew/lib/mod_spatialite',  # Homebrew on macOS ARM
+                    '/usr/local/lib/mod_spatialite',  # Homebrew on macOS Intel
+                    '/usr/lib/x86_64-linux-gnu/mod_spatialite',  # Ubuntu/Debian
+                    '/usr/lib64/mod_spatialite',  # RHEL/CentOS
+                ]
                 
-                # Build the query based on whether it's SpatiaLite or regular SQLite
-                if is_spatialite:
-                    # Try to load SpatiaLite extension from various paths
-                    spatialite_loaded = False
-                    extension_paths = [
-                        'mod_spatialite',  # Default
-                        '/opt/homebrew/lib/mod_spatialite',  # Homebrew on macOS ARM
-                        '/usr/local/lib/mod_spatialite',  # Homebrew on macOS Intel
-                        '/usr/lib/x86_64-linux-gnu/mod_spatialite',  # Ubuntu/Debian
-                        '/usr/lib64/mod_spatialite',  # RHEL/CentOS
-                    ]
-                    
-                    for ext_path in extension_paths:
-                        try:
-                            # 尝试从 Homebrew 安装路径加载
-                            conn.execute(text(f"SELECT load_extension('{ext_path}')"))
-                            spatialite_loaded = True
-                            print(f"Successfully loaded SpatiaLite from: {ext_path}")
-                            break
-                        except Exception as e:
-                            continue
-                    
-                    if spatialite_loaded:
-                        # Use AsGeoJSON for SpatiaLite
-                        query = text(f"""
-                            SELECT 
-                                {id_column} as id,
-                                AsGeoJSON({geom_column}) as geometry_json,
-                                *
-                            FROM {table_name}
-                            WHERE {id_column} IS NOT NULL
-                        """)
-                    else:
-                        # If extension loading fails, treat as regular SQLite
-                        is_spatialite = False
-                        print("Failed to load SpatiaLite extension from any known path")
+                # Enable extension loading
+                conn.enable_load_extension(True)
                 
-                if not is_spatialite:
-                    # For regular SQLite, assume geometry is already stored as GeoJSON string
-                    query = text(f"""
+                for ext_path in extension_paths:
+                    try:
+                        cursor.execute(f"SELECT load_extension('{ext_path}')")
+                        spatialite_loaded = True
+                        print(f"Successfully loaded SpatiaLite from: {ext_path}")
+                        break
+                    except Exception as e:
+                        continue
+                
+                if spatialite_loaded:
+                    # Use AsGeoJSON for SpatiaLite
+                    query = f"""
                         SELECT 
                             {id_column} as id,
-                            {geom_column} as geometry_json,
+                            AsGeoJSON({geom_column}) as geometry_json,
                             *
                         FROM {table_name}
                         WHERE {id_column} IS NOT NULL
-                    """)
+                    """
+                else:
+                    # If extension loading fails, treat as regular SQLite
+                    is_spatialite = False
+                    print("Failed to load SpatiaLite extension from any known path")
+            
+            if not is_spatialite:
+                # For regular SQLite, assume geometry is already stored as GeoJSON string
+                query = f"""
+                    SELECT 
+                        {id_column} as id,
+                        {geom_column} as geometry_json,
+                        *
+                    FROM {table_name}
+                    WHERE {id_column} IS NOT NULL
+                """
+            
+            # Execute query
+            cursor.execute(query)
+            
+            # Process each row
+            for row in cursor:
+                # Convert sqlite3.Row to dict
+                row_dict = dict(row)
+                feature_id = str(row_dict['id'])
                 
-                # Execute query
-                result = conn.execute(query)
+                # Parse geometry
+                geometry = None
+                geometry_data = row_dict.get('geometry_json')
                 
-                # Process each row
-                for row in result:
-                    row_dict = dict(row._mapping)
-                    feature_id = str(row_dict['id'])
-                    
-                    # Parse geometry
-                    geometry = None
-                    geometry_data = row_dict.get('geometry_json')
-                    
-                    if geometry_data:
-                        if isinstance(geometry_data, str):
-                            try:
-                                # Try to parse as JSON
-                                geometry = json.loads(geometry_data)
-                            except json.JSONDecodeError:
-                                # If it's not valid JSON, skip this geometry
-                                geometry = None
-                        elif isinstance(geometry_data, dict):
-                            geometry = geometry_data
-                    
-                    # If geometry is still null, try to use centre_point as fallback
-                    if geometry is None and 'centre_point' in row_dict:
-                        centre_point = row_dict.get('centre_point')
-                        if centre_point and isinstance(centre_point, str):
-                            # Parse WKT format (e.g., "POINT Z (116.42115915 39.98681646 13.26017761)")
-                            match = re.search(r'POINT\s*(?:Z\s*)?\(([\d.\s-]+)\)', centre_point)
-                            if match:
-                                coords = match.group(1).split()
-                                if len(coords) >= 2:
-                                    geometry = {
-                                        "type": "Point",
-                                        "coordinates": [float(coords[0]), float(coords[1])]
-                                    }
-                                    # Add Z coordinate if present
-                                    if len(coords) >= 3:
-                                        geometry["coordinates"].append(float(coords[2]))
-                    
-                    # Remove special columns from properties
-                    properties = {k: v for k, v in row_dict.items() 
-                                if k not in ['id', 'geometry_json', geom_column] and v is not None}
-                    
-                    # Create GeoJSON feature
-                    feature = {
-                        "type": "Feature",
-                        "id": feature_id,
-                        "geometry": geometry,
-                        "properties": properties
-                    }
-                    
-                    # Check if record exists
-                    existing = db.query(KeyValueStore).filter(KeyValueStore.id == feature_id).first()
-                    
-                    if existing:
-                        # Update existing record
-                        existing.value = feature
-                        existing.updated_at = datetime.utcnow()
-                        updated_count += 1
-                    else:
-                        # Create new record
-                        new_record = KeyValueStore(
-                            id=feature_id,
-                            value=feature
-                        )
-                        db.add(new_record)
-                        imported_count += 1
+                if geometry_data:
+                    if isinstance(geometry_data, str):
+                        try:
+                            # Try to parse as JSON
+                            geometry = json.loads(geometry_data)
+                        except json.JSONDecodeError:
+                            # If it's not valid JSON, skip this geometry
+                            geometry = None
+                    elif isinstance(geometry_data, dict):
+                        geometry = geometry_data
                 
-                db.commit()
+                # If geometry is still null, try to use centre_point as fallback
+                if geometry is None and 'centre_point' in row_dict:
+                    centre_point = row_dict.get('centre_point')
+                    if centre_point and isinstance(centre_point, str):
+                        # Parse WKT format (e.g., "POINT Z (116.42115915 39.98681646 13.26017761)")
+                        match = re.search(r'POINT\s*(?:Z\s*)?\(([\d.\s-]+)\)', centre_point)
+                        if match:
+                            coords = match.group(1).split()
+                            if len(coords) >= 2:
+                                geometry = {
+                                    "type": "Point",
+                                    "coordinates": [float(coords[0]), float(coords[1])]
+                                }
+                                # Add Z coordinate if present
+                                if len(coords) >= 3:
+                                    geometry["coordinates"].append(float(coords[2]))
                 
+                # Remove special columns from properties
+                properties = {k: v for k, v in row_dict.items() 
+                            if k not in ['id', 'geometry_json', geom_column] and v is not None}
+                
+                # Create GeoJSON feature
+                feature = {
+                    "type": "Feature",
+                    "id": feature_id,
+                    "geometry": geometry,
+                    "properties": properties
+                }
+                
+                # Check if record exists
+                existing = db.query(KeyValueStore).filter(KeyValueStore.id == feature_id).first()
+                
+                if existing:
+                    # Update existing record
+                    existing.value = feature
+                    existing.updated_at = datetime.utcnow()
+                    updated_count += 1
+                else:
+                    # Create new record
+                    new_record = KeyValueStore(
+                        id=feature_id,
+                        value=feature
+                    )
+                    db.add(new_record)
+                    imported_count += 1
+            
+            db.commit()
+            
+            # Close the sqlite3 connection
+            conn.close()
+            
             return {
                 "message": "SpatiaLite data imported successfully",
                 "imported": imported_count,
