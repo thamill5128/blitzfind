@@ -225,23 +225,6 @@ async def import_spatialite(
                         elif isinstance(geometry_data, dict):
                             geometry = geometry_data
                     
-                    # If geometry is still null, try to use centre_point as fallback
-                    if geometry is None and 'centre_point' in row_dict:
-                        centre_point = row_dict.get('centre_point')
-                        if centre_point and isinstance(centre_point, str):
-                            # Parse WKT format (e.g., "POINT Z (116.42115915 39.98681646 13.26017761)")
-                            match = re.search(r'POINT\s*(?:Z\s*)?\(([\d.\s-]+)\)', centre_point)
-                            if match:
-                                coords = match.group(1).split()
-                                if len(coords) >= 2:
-                                    geometry = {
-                                        "type": "Point",
-                                        "coordinates": [float(coords[0]), float(coords[1])]
-                                    }
-                                    # Add Z coordinate if present
-                                    if len(coords) >= 3:
-                                        geometry["coordinates"].append(float(coords[2]))
-                    
                     # Remove special columns from properties
                     properties = {k: v for k, v in row_dict.items() 
                                 if k not in ['id', 'geometry_json', geom_column] and v is not None}
