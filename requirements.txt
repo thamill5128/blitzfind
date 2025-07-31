@@ -1,9 +1,11 @@
 fastapi==0.109.0
 uvicorn==0.27.0
 sqlalchemy==2.0.25
+aiosqlite==0.19.0
 pydantic==2.5.3
 python-multipart==0.0.6
 geojson==3.1.0
 requests==2.31.0
 geoalchemy2==0.14.3
 shapely==2.0.2
+aiohttp==3.9.1

@@ -1,8 +1,10 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, Column, String, JSON, DateTime, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.pool import NullPool, QueuePool
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import json
@@ -13,14 +15,35 @@ import tempfile
 import shutil
 import re
 import sqlite3
+import asyncio
+from functools import lru_cache
 
 # Create FastAPI app
 app = FastAPI(title="BlitzFind API", description="Simple key-value query system with GeoJSON support")
 
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./blitzfind.db")
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+
+# For async operations, we need to use aiosqlite for SQLite
+if DATABASE_URL.startswith("sqlite"):
+    # Convert sqlite:/// to sqlite+aiosqlite:///
+    ASYNC_DATABASE_URL = DATABASE_URL.replace("sqlite:///", "sqlite+aiosqlite:///")
+else:
+    ASYNC_DATABASE_URL = DATABASE_URL
+
+# Create both sync and async engines (we'll migrate gradually)
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+async_engine = create_async_engine(
+    ASYNC_DATABASE_URL,
+    connect_args={"check_same_thread": False} if ASYNC_DATABASE_URL.startswith("sqlite") else {},
+    pool_size=20,  # Increase pool size for better concurrency
+    max_overflow=40,  # Allow more overflow connections
+    pool_pre_ping=True,  # Verify connections before use
+    pool_recycle=3600  # Recycle connections after 1 hour
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+AsyncSessionLocal = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
 # Database model
@@ -34,6 +57,19 @@ class KeyValueStore(Base):
 
 # Create tables
 Base.metadata.create_all(bind=engine)
+
+# Import index creation function
+from ensure_indexes import ensure_indexes
+
+# Create startup event to ensure indexes
+@app.on_event("startup")
+async def startup_event():
+    """Run startup tasks including index creation"""
+    try:
+        ensure_indexes()
+        print("Database indexes verified/created")
+    except Exception as e:
+        print(f"Warning: Could not create indexes: {e}")
 
 # Pydantic models
 class KeyValueCreate(BaseModel):
@@ -58,6 +94,45 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# Async dependency to get DB session
+async def get_async_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+# Simple in-memory cache for frequently accessed data
+# Cache will store up to 1000 items for 5 minutes
+from datetime import timedelta
+from typing import Tuple
+
+class SimpleCache:
+    def __init__(self, max_size: int = 1000, ttl_minutes: int = 5):
+        self.cache: Dict[str, Tuple[Any, datetime]] = {}
+        self.max_size = max_size
+        self.ttl = timedelta(minutes=ttl_minutes)
+    
+    def get(self, key: str) -> Optional[Any]:
+        if key in self.cache:
+            value, timestamp = self.cache[key]
+            if datetime.utcnow() - timestamp < self.ttl:
+                return value
+            else:
+                del self.cache[key]
+        return None
+    
+    def set(self, key: str, value: Any):
+        # Simple LRU: if cache is full, remove oldest entry
+        if len(self.cache) >= self.max_size:
+            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+            del self.cache[oldest_key]
+        self.cache[key] = (value, datetime.utcnow())
+    
+    def invalidate(self, key: str):
+        if key in self.cache:
+            del self.cache[key]
+
+# Initialize cache
+data_cache = SimpleCache(max_size=1000, ttl_minutes=5)
 
 # API endpoints
 @app.get("/", tags=["Health"])
@@ -329,6 +404,8 @@ async def create_key_value(data: KeyValueCreate):
         existing.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(existing)
+        # Invalidate cache for updated data
+        data_cache.invalidate(f"data:{data.id}")
         return KeyValueResponse(
             id=existing.id,
             value=existing.value,
@@ -341,6 +418,7 @@ async def create_key_value(data: KeyValueCreate):
         db.add(new_record)
         db.commit()
         db.refresh(new_record)
+        # No need to invalidate cache for new records
         return KeyValueResponse(
             id=new_record.id,
             value=new_record.value,
@@ -368,20 +446,37 @@ async def query_by_id(id: str):
         )
 
 @app.get("/data/{id}", tags=["Data"])
-async def get_key_value(id: str):
-    """Get a specific key-value pair by ID"""
-    db = next(get_db())
-    record = db.query(KeyValueStore).filter(KeyValueStore.id == id).first()
+async def get_key_value(id: str, db: AsyncSession = Depends(get_async_db)):
+    """Get a specific key-value pair by ID - Optimized with async DB and caching"""
+    # Check cache first
+    cached_result = data_cache.get(f"data:{id}")
+    if cached_result:
+        return cached_result
+    
+    # Use async query with proper imports
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession
+    
+    # Execute async query
+    result = await db.execute(
+        select(KeyValueStore).where(KeyValueStore.id == id)
+    )
+    record = result.scalar_one_or_none()
     
     if not record:
         raise HTTPException(status_code=404, detail=f"ID '{id}' not found")
     
-    return KeyValueResponse(
+    response = KeyValueResponse(
         id=record.id,
         value=record.value,
         created_at=record.created_at,
         updated_at=record.updated_at
     )
+    
+    # Cache the result
+    data_cache.set(f"data:{id}", response)
+    
+    return response
 
 @app.delete("/data/{id}", tags=["Data"])
 async def delete_key_value(id: str):
@@ -394,6 +489,9 @@ async def delete_key_value(id: str):
     
     db.delete(record)
     db.commit()
+    
+    # Invalidate cache
+    data_cache.invalidate(f"data:{id}")
     
     return {"message": f"ID '{id}' deleted successfully"}
 
