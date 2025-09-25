@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QGIS Server JavaScript Client</title>
+    
+    <!-- OpenLayers CSS and JS -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@v7.3.0/ol.css">
+    <script src="https://cdn.jsdelivr.net/npm/ol@v7.3.0/dist/ol.js"></script>
+    
+    <!-- Bootstrap for UI -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    
+    <style>
+        #map {
+            width: 100%;
+            height: 600px;
+        }
+        .info-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 300px;
+            background: white;
+            padding: 15px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        .layer-control {
+            position: absolute;
+            top: 10px;
+            left: 50px;
+            background: white;
+            padding: 15px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        }
+        .coordinate-display {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: white;
+            padding: 5px 10px;
+            border-radius: 3px;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid p-0">
+        <h2 class="text-center py-3">QGIS Server JavaScript Client</h2>
+        
+        <div class="position-relative">
+            <div id="map"></div>
+            
+            <!-- Layer Control Panel -->
+            <div class="layer-control">
+                <h5>Layers</h5>
+                <div id="layer-list"></div>
+                <hr>
+                <button class="btn btn-sm btn-primary" onclick="refreshLayers()">Refresh</button>
+            </div>
+            
+            <!-- Feature Info Panel -->
+            <div class="info-panel">
+                <h5>Feature Info</h5>
+                <div id="feature-info">
+                    <p class="text-muted">Click on the map to get feature information</p>
+                </div>
+            </div>
+            
+            <!-- Coordinate Display -->
+            <div class="coordinate-display" id="coordinate-display">
+                Coordinates: 0, 0
+            </div>
+        </div>
+        
+        <!-- Additional Controls -->
+        <div class="container mt-3">
+            <div class="row">
+                <div class="col-md-6">
+                    <h5>WFS Query</h5>
+                    <div class="input-group mb-3">
+                        <input type="text" class="form-control" id="cql-filter" placeholder="e.g., population > 1000000">
+                        <button class="btn btn-outline-secondary" onclick="queryFeatures()">Query</button>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <h5>Map Tools</h5>
+                    <button class="btn btn-secondary" onclick="zoomToExtent()">Full Extent</button>
+                    <button class="btn btn-secondary" onclick="exportMap()">Export Map</button>
+                    <button class="btn btn-secondary" onclick="printMap()">Print</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const QGIS_SERVER_URL = 'http://localhost/qgis-server';
+        const DEFAULT_PROJECTION = 'EPSG:3857';
+        
+        // Global variables
+        let map;
+        let wmsLayers = {};
+        let wfsLayers = {};
+        let vectorSource;
+        
+        // Initialize map
+        function initMap() {
+            // Base layers
+            const osmLayer = new ol.layer.Tile({
+                source: new ol.source.OSM(),
+                name: 'OpenStreetMap',
+                visible: true
+            });
+            
+            // Vector source for WFS features
+            vectorSource = new ol.source.Vector();
+            const vectorLayer = new ol.layer.Vector({
+                source: vectorSource,
+                style: new ol.style.Style({
+                    stroke: new ol.style.Stroke({
+                        color: 'rgba(255, 0, 0, 1)',
+                        width: 2
+                    }),
+                    fill: new ol.style.Fill({
+                        color: 'rgba(255, 0, 0, 0.1)'
+                    }),
+                    image: new ol.style.Circle({
+                        radius: 5,
+                        fill: new ol.style.Fill({
+                            color: 'rgba(255, 0, 0, 0.7)'
+                        })
+                    })
+                })
+            });
+            
+            // Create map
+            map = new ol.Map({
+                target: 'map',
+                layers: [osmLayer, vectorLayer],
+                view: new ol.View({
+                    center: ol.proj.fromLonLat([0, 0]),
+                    zoom: 2
+                })
+            });
+            
+            // Add interactions
+            addMapInteractions();
+            
+            // Load QGIS Server layers
+            loadQGISLayers();
+        }
+        
+        // Load layers from QGIS Server
+        async function loadQGISLayers() {
+            try {
+                // Get WMS capabilities
+                const wmsCapUrl = `${QGIS_SERVER_URL}?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetCapabilities`;
+                const wmsResponse = await fetch(wmsCapUrl);
+                const wmsText = await wmsResponse.text();
+                
+                // Parse WMS capabilities (simplified - in production use proper XML parser)
+                const parser = new DOMParser();
+                const wmsDoc = parser.parseFromString(wmsText, 'text/xml');
+                const layers = wmsDoc.querySelectorAll('Layer Layer');
+                
+                const layerListDiv = document.getElementById('layer-list');
+                layerListDiv.innerHTML = '';
+                
+                layers.forEach((layer, index) => {
+                    const name = layer.querySelector('Name')?.textContent;
+                    const title = layer.querySelector('Title')?.textContent || name;
+                    
+                    if (name) {
+                        // Create WMS layer
+                        const wmsLayer = new ol.layer.Image({
+                            source: new ol.source.ImageWMS({
+                                url: QGIS_SERVER_URL,
+                                params: {
+                                    'LAYERS': name,
+                                    'FORMAT': 'image/png',
+                                    'VERSION': '1.3.0',
+                                    'TRANSPARENT': true
+                                },
+                                serverType: 'qgis'
+                            }),
+                            name: name,
+                            visible: false
+                        });
+                        
+                        wmsLayers[name] = wmsLayer;
+                        map.addLayer(wmsLayer);
+                        
+                        // Add to layer control
+                        const checkbox = document.createElement('div');
+                        checkbox.className = 'form-check';
+                        checkbox.innerHTML = `
+                            <input class="form-check-input" type="checkbox" id="layer-${index}" 
+                                   onchange="toggleLayer('${name}', this.checked)">
+                            <label class="form-check-label" for="layer-${index}">
+                                ${title}
+                            </label>
+                        `;
+                        layerListDiv.appendChild(checkbox);
+                    }
+                });
+                
+                // Load WFS capabilities
+                await loadWFSCapabilities();
+                
+            } catch (error) {
+                console.error('Error loading QGIS layers:', error);
+                alert('Error connecting to QGIS Server. Make sure the server is running.');
+            }
+        }
+        
+        // Load WFS capabilities
+        async function loadWFSCapabilities() {
+            try {
+                const wfsCapUrl = `${QGIS_SERVER_URL}?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetCapabilities`;
+                const wfsResponse = await fetch(wfsCapUrl);
+                const wfsText = await wfsResponse.text();
+                
+                // Parse WFS capabilities
+                const parser = new DOMParser();
+                const wfsDoc = parser.parseFromString(wfsText, 'text/xml');
+                const featureTypes = wfsDoc.querySelectorAll('FeatureType');
+                
+                featureTypes.forEach(featureType => {
+                    const name = featureType.querySelector('Name')?.textContent;
+                    if (name) {
+                        wfsLayers[name] = true;
+                    }
+                });
+                
+            } catch (error) {
+                console.error('Error loading WFS capabilities:', error);
+            }
+        }
+        
+        // Toggle layer visibility
+        function toggleLayer(layerName, visible) {
+            if (wmsLayers[layerName]) {
+                wmsLayers[layerName].setVisible(visible);
+            }
+        }
+        
+        // Add map interactions
+        function addMapInteractions() {
+            // Click interaction for GetFeatureInfo
+            map.on('singleclick', function(evt) {
+                const viewResolution = map.getView().getResolution();
+                const coordinate = evt.coordinate;
+                
+                // Clear previous info
+                document.getElementById('feature-info').innerHTML = '<p class="text-muted">Loading...</p>';
+                
+                // Check each visible WMS layer
+                Object.values(wmsLayers).forEach(layer => {
+                    if (layer.getVisible()) {
+                        const url = layer.getSource().getFeatureInfoUrl(
+                            coordinate,
+                            viewResolution,
+                            DEFAULT_PROJECTION,
+                            {
+                                'INFO_FORMAT': 'application/json',
+                                'FEATURE_COUNT': 10
+                            }
+                        );
+                        
+                        if (url) {
+                            fetch(url)
+                                .then(response => response.json())
+                                .then(data => {
+                                    displayFeatureInfo(data);
+                                })
+                                .catch(error => {
+                                    console.error('Error getting feature info:', error);
+                                });
+                        }
+                    }
+                });
+            });
+            
+            // Mouse move for coordinate display
+            map.on('pointermove', function(evt) {
+                const coordinate = ol.proj.toLonLat(evt.coordinate);
+                document.getElementById('coordinate-display').textContent = 
+                    `Lon: ${coordinate[0].toFixed(6)}, Lat: ${coordinate[1].toFixed(6)}`;
+            });
+        }
+        
+        // Display feature information
+        function displayFeatureInfo(data) {
+            const infoDiv = document.getElementById('feature-info');
+            
+            if (data.features && data.features.length > 0) {
+                let html = '';
+                data.features.forEach((feature, index) => {
+                    html += `<div class="mb-3">`;
+                    html += `<h6>Feature ${index + 1}</h6>`;
+                    html += '<table class="table table-sm">';
+                    
+                    for (const [key, value] of Object.entries(feature.properties)) {
+                        html += `<tr><td><strong>${key}:</strong></td><td>${value}</td></tr>`;
+                    }
+                    
+                    html += '</table></div>';
+                });
+                infoDiv.innerHTML = html;
+            } else {
+                infoDiv.innerHTML = '<p class="text-muted">No features found at this location</p>';
+            }
+        }
+        
+        // Query features using CQL filter
+        async function queryFeatures() {
+            const cqlFilter = document.getElementById('cql-filter').value;
+            if (!cqlFilter) {
+                alert('Please enter a CQL filter');
+                return;
+            }
+            
+            // Clear existing features
+            vectorSource.clear();
+            
+            // Query first available WFS layer
+            const layerName = Object.keys(wfsLayers)[0];
+            if (!layerName) {
+                alert('No WFS layers available');
+                return;
+            }
+            
+            const url = `${QGIS_SERVER_URL}?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAME=${layerName}&OUTPUTFORMAT=GeoJSON&CQL_FILTER=${encodeURIComponent(cqlFilter)}`;
+            
+            try {
+                const response = await fetch(url);
+                const geojson = await response.json();
+                
+                const features = new ol.format.GeoJSON().readFeatures(geojson, {
+                    dataProjection: 'EPSG:4326',
+                    featureProjection: DEFAULT_PROJECTION
+                });
+                
+                vectorSource.addFeatures(features);
+                
+                if (features.length > 0) {
+                    // Zoom to features
+                    const extent = vectorSource.getExtent();
+                    map.getView().fit(extent, { padding: [50, 50, 50, 50] });
+                    alert(`Found ${features.length} features`);
+                } else {
+                    alert('No features match the filter');
+                }
+                
+            } catch (error) {
+                console.error('Error querying features:', error);
+                alert('Error executing query');
+            }
+        }
+        
+        // Zoom to full extent
+        function zoomToExtent() {
+            map.getView().setCenter(ol.proj.fromLonLat([0, 0]));
+            map.getView().setZoom(2);
+        }
+        
+        // Export map as image
+        function exportMap() {
+            map.once('rendercomplete', function() {
+                const mapCanvas = document.createElement('canvas');
+                const size = map.getSize();
+                mapCanvas.width = size[0];
+                mapCanvas.height = size[1];
+                const mapContext = mapCanvas.getContext('2d');
+                
+                Array.prototype.forEach.call(
+                    document.querySelectorAll('.ol-layer canvas'),
+                    function(canvas) {
+                        if (canvas.width > 0) {
+                            const opacity = canvas.parentNode.style.opacity;
+                            mapContext.globalAlpha = opacity === '' ? 1 : Number(opacity);
+                            const transform = canvas.style.transform;
+                            const matrix = transform
+                                .match(/^matrix\(([^\(]*)\)$/)[1]
+                                .split(',')
+                                .map(Number);
+                            CanvasRenderingContext2D.prototype.setTransform.apply(
+                                mapContext,
+                                matrix
+                            );
+                            mapContext.drawImage(canvas, 0, 0);
+                        }
+                    }
+                );
+                
+                // Download image
+                mapCanvas.toBlob(function(blob) {
+                    const link = document.createElement('a');
+                    link.download = 'qgis-map-export.png';
+                    link.href = URL.createObjectURL(blob);
+                    link.click();
+                });
+            });
+            map.renderSync();
+        }
+        
+        // Print map
+        function printMap() {
+            window.print();
+        }
+        
+        // Refresh layers
+        function refreshLayers() {
+            loadQGISLayers();
+        }
+        
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', initMap);
+    </script>
+</body>
+</html>
